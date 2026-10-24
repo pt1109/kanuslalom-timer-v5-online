@@ -32,15 +32,41 @@ el.innerHTML='<label for="room-name">Name des neuen Trainingsraums (optional)</l
 document.getElementById('create-room').onclick=createRoom;document.getElementById('join-room').onclick=()=>joinRoom(document.getElementById('join-code').value.trim());}
 async function createRoom(){if(!connected){alert('Keine Verbindung zur Datenbank.');return}const name=document.getElementById('room-name').value.trim().slice(0,60);statusMsg('Trainingsraum wird erstellt …');for(let i=0;i<8;i++){const a=new Uint32Array(1);crypto.getRandomValues(a);const code=String(100000+a[0]%900000);const ref=fbdb.ref('rooms/'+code);try{const result=await ref.transaction(old=>old===null?{name:name||'Training',createdAt:firebase.database.ServerValue.TIMESTAMP,data:defaults()}:undefined,undefined,false);if(result.committed){openRoom(code);return}}catch(e){statusMsg('Erstellen fehlgeschlagen: '+e.message,true);return}}statusMsg('Keinen freien Raumcode gefunden. Bitte erneut versuchen.',true)}
 async function joinRoom(code){if(!/^\d{6}$/.test(code)){alert('Bitte einen sechsstelligen Code eingeben.');return}statusMsg('Trainingsraum wird gesucht …');try{const snap=await fbdb.ref('rooms/'+code).once('value');if(!snap.exists()){statusMsg('Trainingsraum nicht gefunden.',true);return}openRoom(code)}catch(e){statusMsg('Beitritt fehlgeschlagen: '+e.message,true)}}
-function openRoom(code){syncQueue=[];deferredSnapshot=null;if(unsubscribeRoom)unsubscribeRoom();currentCode=code;localStorage.setItem('kanuslalom-room-code',code);roomRef=fbdb.ref('rooms/'+code+'/data');document.getElementById('app-main').style.display='block';roomUI();unsubscribeRoom=roomRef.on('value',snap=>{if(!snap.exists()){statusMsg('Dieser Trainingsraum wurde gelöscht.',true);leaveRoom();return}if(syncBusy || syncQueue.length){deferredSnapshot=snap.val();return}data=normalizeData(snap.val());render() },e=>statusMsg('Lesen fehlgeschlagen: '+e.message,true));statusMsg('Trainingsraum '+code+' verbunden')}
-function leaveRoom(){syncQueue=[];deferredSnapshot=null;if(unsubscribeRoom&&roomRef)roomRef.off('value',unsubscribeRoom);unsubscribeRoom=null;roomRef=null;currentCode=null;localStorage.removeItem('kanuslalom-room-code');document.getElementById('app-main').style.display='none';data=defaults();roomUI();statusMsg(connected?'Bereit – Raum erstellen oder beitreten':'Offline',!connected)}
+function openRoom(code){syncQueue=[];syncBusy=false;deferredSnapshot=null;if(unsubscribeRoom)unsubscribeRoom();currentCode=code;localStorage.setItem('kanuslalom-room-code',code);roomRef=fbdb.ref('rooms/'+code+'/data');document.getElementById('app-main').style.display='block';roomUI();unsubscribeRoom=roomRef.on('value',snap=>{if(!snap.exists()){statusMsg('Dieser Trainingsraum wurde gelöscht.',true);leaveRoom();return}if(syncBusy || syncQueue.length){return}data=normalizeData(snap.val());render() },e=>statusMsg('Lesen fehlgeschlagen: '+e.message,true));statusMsg('Trainingsraum '+code+' verbunden')}
+function leaveRoom(){syncQueue=[];syncBusy=false;deferredSnapshot=null;if(unsubscribeRoom&&roomRef)roomRef.off('value',unsubscribeRoom);unsubscribeRoom=null;roomRef=null;currentCode=null;localStorage.removeItem('kanuslalom-room-code');document.getElementById('app-main').style.display='none';data=defaults();roomUI();statusMsg(connected?'Bereit – Raum erstellen oder beitreten':'Offline',!connected)}
 // Apply only changed fields in a transaction, preserving concurrent edits on other athletes/gates.
 let syncQueue=[],syncBusy=false,deferredSnapshot=null;
 function syncDelta(before,after){if(!roomRef)return;const changes=[];if(before.gateCount!==after.gateCount)changes.push(['gateCount',after.gateCount]);for(let i=0;i<25;i++){const b=before.gates[i],a=after.gates[i];if(JSON.stringify(b)!==JSON.stringify(a))changes.push(['gate',i,a])}
 const bm=new Map(before.athletes.map(a=>[String(a.id),a]));const am=new Map(after.athletes.map(a=>[String(a.id),a]));for(const [id,b] of bm){if(!am.has(id))changes.push(['remove',id]);}
 for(const [id,a] of am){const b=bm.get(id);if(!b){changes.push(['add',id,a]);continue}for(const k of ['name','elapsed','start','running','penalties','runs','expanded']){if(JSON.stringify(b[k])!==JSON.stringify(a[k])){if(k==='penalties'){const keys=new Set([...Object.keys(b.penalties||{}),...Object.keys(a.penalties||{})]);for(const key of keys){if(b.penalties?.[key]!==a.penalties?.[key])changes.push(['pen',id,key,a.penalties?.[key]??null])}}else if(k==='runs'){if(a.runs.length>b.runs.length)changes.push(['run',id,a.runs.slice(b.runs.length)]);else changes.push(['field',id,k,a[k]])}else changes.push(['field',id,k,a[k]])}}}
 function applyQueuedChanges(changes){return roomRef.transaction(remote=>{if(!remote)return;remote=normalizeData(structuredClone(remote));for(const c of changes){const [type,id,key,value]=c;if(type==='gateCount')remote.gateCount=id;else if(type==='gate')remote.gates[id]=key;else if(type==='remove')remote.athletes=remote.athletes.filter(a=>String(a.id)!==id);else if(type==='add'){if(!remote.athletes.some(a=>String(a.id)===id)){let fresh=normalizeAthlete(structuredClone(key));if(remote.athletes.some(a=>a.id===fresh.id))fresh.id=Math.max(0,...remote.athletes.map(a=>Number(a.id)))+1;remote.athletes.push(fresh)}}else{const a=remote.athletes.find(a=>String(a.id)===id);if(!a)continue;if(type==='field')a[key]=key==='runs'?(Array.isArray(value)?value:[]):value;else if(type==='pen'){a.penalties=a.penalties||{};if(value===null)delete a.penalties[key];else a.penalties[key]=value}else if(type==='run'){a.runs=a.runs||[];for(const r of key){const rr={...r,number:a.runs.length+1};a.runs.push(rr)}}}}return remote},undefined,false);}
-function drainSyncQueue(){if(syncBusy||!syncQueue.length||!roomRef)return;syncBusy=true;const batch=syncQueue.shift();applyQueuedChanges(batch).then(result=>{if(!result.committed)statusMsg('Änderung konnte nicht gespeichert werden (Konflikt).',true)}).catch(e=>statusMsg('Speichern fehlgeschlagen: '+e.message,true)).finally(()=>{syncBusy=false;if(syncQueue.length){drainSyncQueue()}else{if(deferredSnapshot!==null){data=normalizeData(deferredSnapshot);deferredSnapshot=null;render()}roomRef.once('value').then(snap=>{if(!syncBusy&&!syncQueue.length&&snap.exists()){data=normalizeData(snap.val());render()}}).catch(()=>{})}})}
+function drainSyncQueue(){
+  if(syncBusy||!syncQueue.length||!roomRef)return;
+  syncBusy=true;
+  const activeRef=roomRef;
+  const batch=syncQueue.shift();
+  applyQueuedChanges(batch).then(result=>{
+    if(activeRef!==roomRef)return;
+    if(!result.committed){
+      statusMsg('Änderung konnte nicht gespeichert werden (Konflikt).',true);
+      return;
+    }
+    // Firebase fires optimistic local value events during transactions.
+    // Only use the committed transaction snapshot, never a deferred
+    // intermediate event that can contain an earlier penalty state.
+    if(syncQueue.length===0){
+      data=normalizeData(result.snapshot.val());
+      render();
+    }
+  }).catch(e=>{
+    if(activeRef===roomRef)statusMsg('Speichern fehlgeschlagen: '+e.message,true);
+  }).finally(()=>{
+    if(activeRef!==roomRef)return;
+    deferredSnapshot=null;
+    syncBusy=false;
+    if(syncQueue.length)drainSyncQueue();
+  });
+}
 if(changes.length){syncQueue.push(changes);drainSyncQueue()} }
 try{firebase.initializeApp(dbConfig);fbdb=firebase.database();firebase.auth().signInAnonymously().then(()=>{authReady=true;roomUI();const old=localStorage.getItem('kanuslalom-room-code');if(old&&/^\d{6}$/.test(old))joinRoom(old);else statusMsg('Bereit – Raum erstellen oder beitreten')}).catch(e=>statusMsg('Anonyme Anmeldung fehlgeschlagen: '+e.message,true));fbdb.ref('.info/serverTimeOffset').on('value',s=>{serverOffset=s.val()||0});fbdb.ref('.info/connected').on('value',s=>{connected=!!s.val();if(currentCode)statusMsg(connected?'Raum '+currentCode+' verbunden':'Offline – Änderungen vorübergehend gesperrt',!connected);else if(authReady)statusMsg(connected?'Bereit – Raum erstellen oder beitreten':'Offline',!connected)})}catch(e){statusMsg('Firebase konnte nicht geladen werden: '+e.message,true)}
 </script></body></html>
